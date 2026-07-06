@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
     <title>Ruta óptima entre varios lugares</title>
     <script>
       let map;
@@ -12,10 +13,12 @@
       let orderedStops = [];
       let destinoFinal = null;
       let routePath = [];
+      let lastRoute = null;
       let lastRecalcTime = 0;
       let completedStops = [];
       let currentView = 'setup';
 
+      const STORAGE_KEY = 'locator-route-state';
       const DEVIATION_THRESHOLD_METERS = 60;
       const MIN_MS_BETWEEN_RECALCS = 8000;
       const STOP_COMPLETION_THRESHOLD_METERS = 70;
@@ -28,7 +31,12 @@
         directionsService = new google.maps.DirectionsService();
         directionsRenderer = new google.maps.DirectionsRenderer({
           map: map.innerMap,
-          suppressMarkers: false
+          suppressMarkers: false,
+          preserveViewport: false,
+          polylineOptions: {
+            strokeColor: '#1a73e8',
+            strokeWeight: 5
+          }
         });
 
         obtenerUbicacionUsuario();
@@ -40,6 +48,10 @@
         document
           .getElementById('calc-route-btn')
           .addEventListener('click', calcularRutaOptima);
+
+        document
+          .getElementById('view-map-btn')
+          .addEventListener('click', verMapaDeRuta);
 
         document
           .getElementById('start-nav-btn')
@@ -209,6 +221,37 @@
         return destinos;
       }
 
+      function guardarEstadoRuta() {
+        const payload = {
+          userLocation: userLocation
+            ? { lat: userLocation.lat, lng: userLocation.lng }
+            : null,
+          destinoFinal: destinoFinal
+            ? {
+                displayName: destinoFinal.displayName,
+                location: destinoFinal.location
+                  ? {
+                      lat: destinoFinal.location.lat(),
+                      lng: destinoFinal.location.lng()
+                    }
+                  : null
+              }
+            : null,
+          orderedStops: orderedStops.map((stop) => ({
+            displayName: stop.displayName,
+            location: stop.location
+              ? { lat: stop.location.lat(), lng: stop.location.lng() }
+              : null
+          })),
+          completedStops,
+          routePath: routePath.map((point) => ({ lat: point.lat(), lng: point.lng() }))
+        };
+        const serialized = JSON.stringify(payload);
+        sessionStorage.setItem(STORAGE_KEY, serialized);
+        localStorage.setItem(STORAGE_KEY, serialized);
+        return payload;
+      }
+
       function calcularRutaOptima() {
         if (!userLocation) {
           setStatus('Todavía no se tiene tu ubicación como origen. Espera un momento o revisa los permisos de ubicación.', 'both');
@@ -247,16 +290,21 @@
           },
           (result, status) => {
             if (status === google.maps.DirectionsStatus.OK) {
+              const route = result.routes[0];
+              lastRoute = route;
               directionsRenderer.setDirections(result);
-              const order = result.routes[0].waypoint_order;
+              const order = route.waypoint_order;
               orderedStops = order.map((i) => waypointsInput[i]);
               completedStops = new Array(orderedStops.length).fill(false);
-              routePath = result.routes[0].overview_path;
+              routePath = route.overview_path;
               mostrarOrdenOptimizado(result);
+              const state = guardarEstadoRuta();
+              const encodedState = encodeURIComponent(JSON.stringify(state));
               setStatus('Ruta reordenada para reducir distancia y consumo.', 'both');
               document.getElementById('start-nav-btn').disabled = false;
               document.getElementById('complete-stop-btn').disabled = false;
-              mostrarVista('mapa');
+              document.getElementById('view-map-btn').disabled = false;
+              window.location.href = 'mapa.html?route=' + encodedState;
             } else {
               setStatus('No se pudo calcular la ruta (' + status + ').', 'both');
             }
@@ -274,6 +322,22 @@
         if (tieneDatos && userLocation) {
           calcularRutaOptima();
         }
+      }
+
+      function verMapaDeRuta() {
+        const serializedState = sessionStorage.getItem(STORAGE_KEY) || localStorage.getItem(STORAGE_KEY);
+        if (!serializedState && !lastRoute) {
+          setStatus('Primero calcula una ruta para ver el mapa.', 'both');
+          return;
+        }
+        if (serializedState) {
+          const encodedState = encodeURIComponent(serializedState);
+          window.location.href = 'mapa.html?route=' + encodedState;
+          return;
+        }
+        const state = guardarEstadoRuta();
+        const encodedState = encodeURIComponent(JSON.stringify(state));
+        window.location.href = 'mapa.html?route=' + encodedState;
       }
 
       function mostrarOrdenOptimizado(result) {
@@ -478,6 +542,7 @@
         padding: 0;
         font-family: Arial, sans-serif;
         background: #f5f7fb;
+        overscroll-behavior: none;
       }
       .view {
         display: none;
@@ -492,9 +557,10 @@
         justify-content: center;
         padding: 24px 16px;
         box-sizing: border-box;
+        min-height: 100dvh;
       }
       .panel {
-        width: min(100%, 520px);
+        width: min(100%, 560px);
         padding: 20px;
         background: #fff;
         border-radius: 16px;
@@ -518,6 +584,7 @@
       }
       #add-stop-btn,
       #calc-route-btn,
+      #view-map-btn,
       #start-nav-btn,
       #stop-nav-btn,
       #complete-stop-btn {
@@ -535,6 +602,10 @@
         background: #1a73e8;
         color: #fff;
       }
+      #view-map-btn {
+        background: #e8f0fe;
+        color: #1a73e8;
+      }
       #start-nav-btn {
         background: #34a853;
         color: #fff;
@@ -549,6 +620,7 @@
       }
       #add-stop-btn:disabled,
       #calc-route-btn:disabled,
+      #view-map-btn:disabled,
       #start-nav-btn:disabled,
       #stop-nav-btn:disabled,
       #complete-stop-btn:disabled {
@@ -597,12 +669,15 @@
       }
       .map-shell {
         position: relative;
-        height: 100%;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
       }
       .map-toolbar {
         position: absolute;
         top: 16px;
         left: 16px;
+        right: 16px;
         z-index: 10;
         display: flex;
         flex-wrap: wrap;
@@ -615,9 +690,10 @@
       .map-status {
         position: absolute;
         left: 16px;
+        right: 16px;
         bottom: 20px;
         z-index: 10;
-        max-width: min(90%, 360px);
+        max-width: min(100%, 420px);
         padding: 10px 12px;
         background: rgba(255, 255, 255, 0.95);
         border-radius: 10px;
@@ -625,8 +701,52 @@
       }
       gmp-map {
         height: 100%;
-        min-height: 100vh;
+        min-height: 0;
         display: block;
+        flex: 1;
+      }
+      @media (max-width: 700px) {
+        body {
+          font-size: 15px;
+        }
+        .setup-view {
+          align-items: flex-start;
+          padding: 10px;
+        }
+        .panel {
+          padding: 14px;
+          border-radius: 12px;
+        }
+        .place-row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .remove-btn {
+          align-self: flex-end;
+          width: auto;
+        }
+        #add-stop-btn,
+        #calc-route-btn,
+        #view-map-btn,
+        #start-nav-btn,
+        #stop-nav-btn,
+        #complete-stop-btn {
+          width: 100%;
+          margin-right: 0;
+          padding: 10px 12px;
+        }
+        .map-toolbar {
+          top: auto;
+          bottom: 12px;
+          left: 10px;
+          right: 10px;
+          flex-direction: column;
+        }
+        .map-status {
+          left: 10px;
+          right: 10px;
+          bottom: 176px;
+        }
       }
     </style>
   </head>
@@ -671,6 +791,7 @@
 
         <button id="add-stop-btn" type="button">Agregar otra parada</button>
         <button id="calc-route-btn" type="button">Calcular ruta</button>
+        <button id="view-map-btn" type="button" disabled>Ver mapa</button>
 
         <div id="route-status"></div>
         <div id="route-order"></div>

@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+    <title>Mapa de ruta</title>
+    <script>
+      let map;
+      let directionsService;
+      let directionsRenderer;
+      let userLocation = null;
+      let userMarker = null;
+      let watchId = null;
+      let orderedStops = [];
+      let destinoFinal = null;
+      let routePath = [];
+      let lastRecalcTime = 0;
+      let completedStops = [];
+
+      const STORAGE_KEY = 'locator-route-state';
+      const DEVIATION_THRESHOLD_METERS = 60;
+      const MIN_MS_BETWEEN_RECALCS = 8000;
+      const STOP_COMPLETION_THRESHOLD_METERS = 70;
+
+      async function init() {
+        await customElements.whenDefined('gmp-map');
+        map = document.querySelector('gmp-map');
+
+        const inicializarMapa = () => {
+          if (!map || !map.innerMap) {
+            setTimeout(inicializarMapa, 200);
+            return;
+          }
+
+          map.innerMap.setOptions({ mapTypeControl: false });
+
+          directionsService = new google.maps.DirectionsService();
+          directionsRenderer = new google.maps.DirectionsRenderer({
+            map: map.innerMap,
+            suppressMarkers: false,
+            preserveViewport: false,
+            polylineOptions: {
+              strokeColor: '#1a73e8',
+              strokeWeight: 5
+            }
+          });
+
+          document.getElementById('start-nav-btn').addEventListener('click', iniciarNavegacion);
+          document.getElementById('stop-nav-btn').addEventListener('click', detenerNavegacion);
+          document.getElementById('complete-stop-btn').addEventListener('click', completarParadaManual);
+          document.getElementById('back-btn').addEventListener('click', () => {
+            window.location.href = 'index.html';
+          });
+
+          cargarEstadoRuta();
+          obtenerUbicacionUsuario();
+        };
+
+        inicializarMapa();
+      }
+
+      function cargarEstadoRuta() {
+        let state = null;
+        const params = new URLSearchParams(window.location.search);
+        const routeParam = params.get('route');
+
+        if (routeParam) {
+          try {
+            state = JSON.parse(decodeURIComponent(routeParam));
+          } catch (error) {
+            console.error(error);
+          }
+        }
+
+        if (!state) {
+          const raw = sessionStorage.getItem(STORAGE_KEY) || localStorage.getItem(STORAGE_KEY);
+          if (!raw) {
+            setStatus('No hay una ruta guardada. Vuelve a la pantalla de planificación para calcular una.', 'both');
+            return;
+          }
+          try {
+            state = JSON.parse(raw);
+          } catch (error) {
+            console.error(error);
+            setStatus('No se pudo cargar la ruta guardada.', 'both');
+            return;
+          }
+        }
+
+        try {
+          if (state.userLocation) {
+            userLocation = state.userLocation;
+          }
+          if (state.destinoFinal && state.destinoFinal.location) {
+            destinoFinal = {
+              displayName: state.destinoFinal.displayName,
+              location: new google.maps.LatLng(state.destinoFinal.location.lat, state.destinoFinal.location.lng)
+            };
+          }
+          orderedStops = (state.orderedStops || []).map((stop) => ({
+            displayName: stop.displayName,
+            location: new google.maps.LatLng(stop.location.lat, stop.location.lng)
+          }));
+          completedStops = Array.isArray(state.completedStops) ? state.completedStops : [];
+          routePath = (state.routePath || []).map((point) => new google.maps.LatLng(point.lat, point.lng));
+
+          dibujarRutaGuardada();
+        } catch (error) {
+          console.error(error);
+          setStatus('No se pudo cargar la ruta guardada.', 'both');
+        }
+      }
+
+      function setStatus(message, target = 'both') {
+        const mapStatus = document.getElementById('map-route-status');
+        mapStatus.textContent = message;
+      }
+
+      function dibujarRutaGuardada() {
+        if (!directionsService || !directionsRenderer || !destinoFinal || !userLocation || !orderedStops.length) {
+          return;
+        }
+
+        const waypoints = orderedStops.map((d) => ({ location: d.location, stopover: true }));
+        directionsService.route(
+          {
+            origin: userLocation,
+            destination: destinoFinal.location,
+            waypoints,
+            optimizeWaypoints: false,
+            travelMode: google.maps.TravelMode.DRIVING
+          },
+          (result, status) => {
+            if (status === google.maps.DirectionsStatus.OK) {
+              directionsRenderer.setDirections(result);
+              mostrarOrdenOptimizado();
+              mostrarRutaEnMapa(result.routes[0]);
+              setStatus('Ruta cargada correctamente.', 'both');
+              document.getElementById('start-nav-btn').disabled = false;
+              document.getElementById('complete-stop-btn').disabled = false;
+            } else {
+              setStatus('No se pudo cargar la ruta (' + status + ').', 'both');
+            }
+          }
+        );
+      }
+
+      function obtenerUbicacionUsuario() {
+        if (!navigator.geolocation) {
+          setStatus('Este navegador no soporta geolocalización.', 'both');
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            userLocation = {
+              lat: position.coords.latitude,
+              lng: position.coords.longitude
+            };
+            actualizarMarcadorUsuario(position);
+            if (map && map.innerMap) {
+              map.innerMap.setCenter(userLocation);
+            }
+            dibujarRutaGuardada();
+          },
+          (error) => {
+            setStatus('No se pudo obtener tu ubicación (' + error.message + ').', 'both');
+          }
+        );
+      }
+
+      function actualizarMarcadorUsuario(position) {
+        const heading = position.coords.heading;
+        const icon = heading !== null && heading !== undefined && !isNaN(heading)
+          ? {
+              path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+              scale: 5,
+              rotation: heading,
+              fillColor: '#1a73e8',
+              fillOpacity: 1,
+              strokeColor: '#ffffff',
+              strokeWeight: 2
+            }
+          : {
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 8,
+              fillColor: '#1a73e8',
+              fillOpacity: 1,
+              strokeColor: '#ffffff',
+              strokeWeight: 2
+            };
+
+        if (!userMarker) {
+          userMarker = new google.maps.Marker({
+            map: map.innerMap,
+            position: userLocation,
+            icon,
+            zIndex: 999
+          });
+        } else {
+          userMarker.setPosition(userLocation);
+          userMarker.setIcon(icon);
+        }
+      }
+
+      function mostrarRutaEnMapa(route) {
+        if (!map || !map.innerMap) return;
+        setTimeout(() => {
+          google.maps.event.trigger(map.innerMap, 'resize');
+          const bounds = new google.maps.LatLngBounds();
+          route.legs.forEach((leg) => {
+            bounds.extend(leg.start_location);
+            bounds.extend(leg.end_location);
+          });
+          map.innerMap.fitBounds(bounds, 48);
+        }, 180);
+      }
+
+      function mostrarOrdenOptimizado() {
+        const orderEl = document.getElementById('route-order');
+        if (!orderedStops.length) {
+          orderEl.innerHTML = '';
+          return;
+        }
+
+        let html = '<ol class="stop-list">';
+        orderedStops.forEach((stop, index) => {
+          const completed = completedStops[index];
+          const label = stop.displayName || 'Parada ' + (index + 1);
+          html += '<li class="stop-item' + (completed ? ' completed' : '') + '"><span class="stop-label">' + label + '</span><button type="button" class="complete-btn" data-index="' + index + '"' + (completed ? ' disabled' : '') + '>' + (completed ? 'Completada' : 'Marcar como completada') + '</button></li>';
+        });
+        html += '</ol>';
+        orderEl.innerHTML = html;
+
+        orderEl.querySelectorAll('.complete-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            marcarParadaCompletada(Number(btn.dataset.index));
+          });
+        });
+      }
+
+      function marcarParadaCompletada(index) {
+        if (index < 0 || index >= completedStops.length || completedStops[index]) return;
+        completedStops[index] = true;
+        mostrarOrdenOptimizado();
+        setStatus('Parada marcada como completada.', 'both');
+      }
+
+      function completarParadaManual() {
+        if (!orderedStops.length) {
+          setStatus('Primero calcula una ruta.', 'both');
+          return;
+        }
+        if (!userLocation) {
+          setStatus('Esperando tu ubicación para marcar la parada.', 'both');
+          return;
+        }
+
+        if (completarParadaMasCercana(userLocation)) {
+          setStatus('Parada marcada como completada.', 'both');
+        } else {
+          setStatus('Todavía no estás cerca de una parada pendiente.', 'both');
+        }
+      }
+
+      function completarParadaMasCercana(location) {
+        if (!orderedStops.length) return false;
+        const currentPoint = new google.maps.LatLng(location.lat, location.lng);
+        for (let index = 0; index < orderedStops.length; index += 1) {
+          if (completedStops[index]) continue;
+          const distance = google.maps.geometry.spherical.computeDistanceBetween(currentPoint, orderedStops[index].location);
+          if (distance <= STOP_COMPLETION_THRESHOLD_METERS) {
+            marcarParadaCompletada(index);
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function iniciarNavegacion() {
+        if (!destinoFinal) {
+          setStatus('Primero calcula una ruta.', 'both');
+          return;
+        }
+        if (!navigator.geolocation) {
+          setStatus('Este navegador no soporta seguimiento de ubicación en vivo.', 'both');
+          return;
+        }
+        document.getElementById('start-nav-btn').disabled = true;
+        document.getElementById('stop-nav-btn').disabled = false;
+        setStatus('Navegación iniciada. Siguiendo tu posición...', 'both');
+        watchId = navigator.geolocation.watchPosition(
+          onPositionUpdate,
+          (error) => {
+            setStatus('Error obteniendo tu posición (' + error.message + ').', 'both');
+          },
+          { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+        );
+      }
+
+      function detenerNavegacion() {
+        if (watchId !== null) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+        document.getElementById('start-nav-btn').disabled = false;
+        document.getElementById('stop-nav-btn').disabled = true;
+        setStatus('Navegación detenida.', 'both');
+      }
+
+      function onPositionUpdate(position) {
+        userLocation = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude
+        };
+        map.center = userLocation;
+        actualizarMarcadorUsuario(position);
+        completarParadaMasCercana(userLocation);
+        if (huboDesvio(userLocation)) {
+          recalcularDesdePosicionActual();
+        }
+      }
+
+      function huboDesvio(location) {
+        if (!routePath || routePath.length === 0) return false;
+        const puntoActual = new google.maps.LatLng(location.lat, location.lng);
+        let distanciaMinima = Infinity;
+        for (let i = 0; i < routePath.length; i++) {
+          const distancia = google.maps.geometry.spherical.computeDistanceBetween(puntoActual, routePath[i]);
+          if (distancia < distanciaMinima) {
+            distanciaMinima = distancia;
+          }
+        }
+        return distanciaMinima > DEVIATION_THRESHOLD_METERS;
+      }
+
+      function recalcularDesdePosicionActual() {
+        const now = Date.now();
+        if (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS) return;
+        lastRecalcTime = now;
+        setStatus('Te desviaste de la ruta. Recalculando...', 'both');
+        directionsService.route(
+          {
+            origin: userLocation,
+            destination: destinoFinal.location,
+            waypoints: orderedStops.map((d) => ({ location: d.location, stopover: true })),
+            optimizeWaypoints: false,
+            travelMode: google.maps.TravelMode.DRIVING
+          },
+          (result, status) => {
+            if (status === google.maps.DirectionsStatus.OK) {
+              directionsRenderer.setDirections(result);
+              routePath = result.routes[0].overview_path;
+              mostrarOrdenOptimizado();
+              setStatus('Ruta recalculada.', 'both');
+            } else {
+              setStatus('No se pudo recalcular la ruta (' + status + ').', 'both');
+            }
+          }
+        );
+      }
+
+      document.addEventListener('DOMContentLoaded', init);
+    </script>
+    <script type="module" src="https://ajax.googleapis.com/ajax/libs/@googlemaps/extended-component-library/0.6.11/index.min.js"></script>
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        font-family: Arial, sans-serif;
+        background: #f5f7fb;
+        overscroll-behavior: none;
+      }
+      .shell {
+        position: relative;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+      }
+      .topbar {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        right: 16px;
+        z-index: 10;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 12px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+      }
+      .status {
+        position: absolute;
+        left: 16px;
+        right: 16px;
+        bottom: 20px;
+        z-index: 10;
+        max-width: min(100%, 420px);
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 10px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+      }
+      #back-btn { background: #f1f3f4; }
+      #start-nav-btn { background: #34a853; color: #fff; }
+      #stop-nav-btn { background: #ea4335; color: #fff; }
+      #complete-stop-btn { background: #ffb300; color: #111; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      #route-order { font-size: 13px; margin-top: 8px; }
+      .stop-list { padding-left: 18px; display: grid; gap: 8px; }
+      .stop-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .stop-item.completed { color: #188038; }
+      .complete-btn { border: 1px solid #1a73e8; background: #e8f0fe; color: #1a73e8; border-radius: 4px; padding: 4px 8px; cursor: pointer; }
+      gmp-map {
+        height: 100%;
+        min-height: 0;
+        display: block;
+        flex: 1;
+      }
+      @media (max-width: 700px) {
+        .topbar { top: auto; bottom: 12px; left: 10px; right: 10px; flex-direction: column; }
+        .status { left: 10px; right: 10px; bottom: 176px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="topbar">
+        <button id="back-btn" type="button">Volver</button>
+        <button id="start-nav-btn" type="button" disabled>Iniciar navegación</button>
+        <button id="stop-nav-btn" type="button" disabled>Detener navegación</button>
+        <button id="complete-stop-btn" type="button" disabled>Marcar como completada</button>
+      </div>
+      <div id="map-route-status" class="status">Cargando ruta…</div>
+      <gmp-map center="40.749933,-73.98633" zoom="13" map-id="DEMO_MAP_ID"></gmp-map>
+    </div>
+  </body>
+</html>
