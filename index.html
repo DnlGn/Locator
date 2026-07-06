@@ -9,11 +9,12 @@
       let userLocation = null;
       let userMarker = null;
       let watchId = null;
-      let orderedStops = []; // paradas intermedias en el orden final (sin el destino)
+      let orderedStops = [];
       let destinoFinal = null;
-      let routePath = []; // overview_path de la ruta activa, para detectar desvíos
+      let routePath = [];
       let lastRecalcTime = 0;
       let completedStops = [];
+      let currentView = 'setup';
 
       const DEVIATION_THRESHOLD_METERS = 60;
       const MIN_MS_BETWEEN_RECALCS = 8000;
@@ -30,7 +31,6 @@
           suppressMarkers: false
         });
 
-        // Ubicar al usuario para usarlo como origen fijo
         obtenerUbicacionUsuario();
 
         document
@@ -48,6 +48,57 @@
         document
           .getElementById('stop-nav-btn')
           .addEventListener('click', detenerNavegacion);
+
+        document
+          .getElementById('complete-stop-btn')
+          .addEventListener('click', completarParadaManual);
+
+        window.addEventListener('hashchange', manejarHash);
+        manejarHash();
+      }
+
+      function manejarHash() {
+        const hash = window.location.hash.replace('#', '');
+        if (hash === 'mapa') {
+          mostrarVista('mapa');
+        } else {
+          mostrarVista('setup');
+        }
+      }
+
+      function mostrarVista(vista) {
+        currentView = vista;
+        document.querySelectorAll('.view').forEach((view) => {
+          view.classList.toggle('active', view.id === `${vista}-view`);
+        });
+
+        if (vista === 'mapa') {
+          if (window.location.hash !== '#mapa') {
+            window.location.hash = 'mapa';
+          }
+          if (map && map.innerMap) {
+            setTimeout(() => {
+              google.maps.event.trigger(map.innerMap, 'resize');
+              if (userLocation) {
+                map.innerMap.setCenter(userLocation);
+              }
+            }, 0);
+          }
+        } else if (window.location.hash !== '') {
+          window.location.hash = '';
+        }
+      }
+
+      function setStatus(message, target = 'both') {
+        const setupStatus = document.getElementById('route-status');
+        const mapStatus = document.getElementById('map-route-status');
+
+        if (target === 'setup' || target === 'both') {
+          setupStatus.textContent = message;
+        }
+        if (target === 'map' || target === 'both') {
+          mapStatus.textContent = message;
+        }
       }
 
       function obtenerUbicacionUsuario() {
@@ -82,10 +133,6 @@
         );
       }
 
-      // Crea o actualiza el marcador de "tu posición" en el mapa.
-      // Si el navegador reporta un rumbo (heading), se dibuja como flecha
-      // orientada; si no, como un punto simple (igual que el "puck" de
-      // Google Maps).
       function actualizarMarcadorUsuario(position) {
         const heading = position.coords.heading;
         const icon =
@@ -148,9 +195,7 @@
       }
 
       function obtenerDestinosSeleccionados() {
-        const pickers = document.querySelectorAll(
-          '#places-list gmpx-place-picker'
-        );
+        const pickers = document.querySelectorAll('#places-list gmpx-place-picker');
         const destinos = [];
         pickers.forEach((picker) => {
           const place = picker.value;
@@ -165,19 +210,15 @@
       }
 
       function calcularRutaOptima() {
-        const statusEl = document.getElementById('route-status');
-
         if (!userLocation) {
-          statusEl.textContent =
-            'Todavía no se tiene tu ubicación como origen. Espera un momento o revisa los permisos de ubicación.';
+          setStatus('Todavía no se tiene tu ubicación como origen. Espera un momento o revisa los permisos de ubicación.', 'both');
           return;
         }
 
         const destinos = obtenerDestinosSeleccionados();
 
         if (destinos.length === 0) {
-          statusEl.textContent =
-            'Ingresa al menos un lugar válido en los campos de búsqueda.';
+          setStatus('Ingresa al menos un lugar válido en los campos de búsqueda.', 'both');
           return;
         }
 
@@ -185,11 +226,11 @@
         const waypointsInput = destinos.slice(0, -1);
 
         if (waypointsInput.length === 0) {
-          statusEl.textContent = 'Se necesita al menos una parada intermedia para optimizar la ruta.';
+          setStatus('Se necesita al menos una parada intermedia para optimizar la ruta.', 'both');
           return;
         }
 
-        statusEl.textContent = 'Calculando la ruta óptima para ahorrar combustible...';
+        setStatus('Calculando la ruta óptima para ahorrar combustible...', 'both');
 
         directionsService.route(
           {
@@ -212,11 +253,12 @@
               completedStops = new Array(orderedStops.length).fill(false);
               routePath = result.routes[0].overview_path;
               mostrarOrdenOptimizado(result);
-              statusEl.textContent = 'Ruta reordenada para reducir distancia y consumo.';
+              setStatus('Ruta reordenada para reducir distancia y consumo.', 'both');
               document.getElementById('start-nav-btn').disabled = false;
+              document.getElementById('complete-stop-btn').disabled = false;
+              mostrarVista('mapa');
             } else {
-              statusEl.textContent =
-                'No se pudo calcular la ruta (' + status + ').';
+              setStatus('No se pudo calcular la ruta (' + status + ').', 'both');
             }
           }
         );
@@ -276,8 +318,24 @@
 
         completedStops[index] = true;
         mostrarOrdenOptimizado();
-        document.getElementById('route-status').textContent =
-          'Parada marcada como completada.';
+        setStatus('Parada marcada como completada.', 'both');
+      }
+
+      function completarParadaManual() {
+        if (!orderedStops.length) {
+          setStatus('Primero calcula una ruta.', 'both');
+          return;
+        }
+        if (!userLocation) {
+          setStatus('Esperando tu ubicación para marcar la parada.', 'both');
+          return;
+        }
+
+        if (completarParadaMasCercana(userLocation)) {
+          setStatus('Parada marcada como completada.', 'both');
+        } else {
+          setStatus('Todavía no estás cerca de una parada pendiente.', 'both');
+        }
       }
 
       function completarParadaMasCercana(location) {
@@ -303,27 +361,23 @@
       }
 
       function iniciarNavegacion() {
-        const statusEl = document.getElementById('route-status');
-
         if (!destinoFinal) {
-          statusEl.textContent = 'Primero calcula una ruta.';
+          setStatus('Primero calcula una ruta.', 'both');
           return;
         }
         if (!navigator.geolocation) {
-          statusEl.textContent =
-            'Este navegador no soporta seguimiento de ubicación en vivo.';
+          setStatus('Este navegador no soporta seguimiento de ubicación en vivo.', 'both');
           return;
         }
 
         document.getElementById('start-nav-btn').disabled = true;
         document.getElementById('stop-nav-btn').disabled = false;
-        statusEl.textContent = 'Navegación iniciada. Siguiendo tu posición...';
+        setStatus('Navegación iniciada. Siguiendo tu posición...', 'both');
 
         watchId = navigator.geolocation.watchPosition(
           onPositionUpdate,
           (error) => {
-            statusEl.textContent =
-              'Error obteniendo tu posición (' + error.message + ').';
+            setStatus('Error obteniendo tu posición (' + error.message + ').', 'both');
           },
           {
             enableHighAccuracy: true,
@@ -340,8 +394,7 @@
         }
         document.getElementById('start-nav-btn').disabled = false;
         document.getElementById('stop-nav-btn').disabled = true;
-        document.getElementById('route-status').textContent =
-          'Navegación detenida.';
+        setStatus('Navegación detenida.', 'both');
       }
 
       function onPositionUpdate(position) {
@@ -350,10 +403,7 @@
           lng: position.coords.longitude
         };
 
-        // Mantener la misma vista: solo se recentra el mapa en la
-        // posición actual, sin cambiar el zoom que ya tenía el usuario.
         map.center = userLocation;
-
         actualizarMarcadorUsuario(position);
         completarParadaMasCercana(userLocation);
 
@@ -362,8 +412,6 @@
         }
       }
 
-      // Calcula la distancia mínima entre la posición actual y el trazo
-      // de la ruta activa (routePath) para saber si el usuario se desvió.
       function huboDesvio(location) {
         if (!routePath || routePath.length === 0) return false;
 
@@ -386,13 +434,11 @@
       function recalcularDesdePosicionActual() {
         const now = Date.now();
         if (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS) {
-          return; // evita recalcular demasiado seguido
+          return;
         }
         lastRecalcTime = now;
 
-        const statusEl = document.getElementById('route-status');
-        statusEl.textContent =
-          'Te desviaste de la ruta. Recalculando...';
+        setStatus('Te desviaste de la ruta. Recalculando...', 'both');
 
         directionsService.route(
           {
@@ -402,9 +448,6 @@
               location: d.location,
               stopover: true
             })),
-            // Se mantiene el orden ya definido en el cálculo inicial;
-            // no se vuelve a optimizar para no cambiar el plan de paradas
-            // mientras se está navegando.
             optimizeWaypoints: false,
             travelMode: google.maps.TravelMode.DRIVING
           },
@@ -413,10 +456,9 @@
               directionsRenderer.setDirections(result);
               routePath = result.routes[0].overview_path;
               mostrarOrdenOptimizado(result);
-              statusEl.textContent = 'Ruta recalculada.';
+              setStatus('Ruta recalculada.', 'both');
             } else {
-              statusEl.textContent =
-                'No se pudo recalcular la ruta (' + status + ').';
+              setStatus('No se pudo recalcular la ruta (' + status + ').', 'both');
             }
           }
         );
@@ -435,10 +477,28 @@
         margin: 0;
         padding: 0;
         font-family: Arial, sans-serif;
+        background: #f5f7fb;
+      }
+      .view {
+        display: none;
+        min-height: 100%;
+      }
+      .view.active {
+        display: block;
+      }
+      .setup-view {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px 16px;
+        box-sizing: border-box;
       }
       .panel {
-        padding: 16px 20px;
-        max-width: 480px;
+        width: min(100%, 520px);
+        padding: 20px;
+        background: #fff;
+        border-radius: 16px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
       }
       .place-row {
         display: flex;
@@ -459,11 +519,12 @@
       #add-stop-btn,
       #calc-route-btn,
       #start-nav-btn,
-      #stop-nav-btn {
+      #stop-nav-btn,
+      #complete-stop-btn {
         margin-top: 8px;
         margin-right: 8px;
         padding: 8px 14px;
-        border-radius: 4px;
+        border-radius: 6px;
         border: none;
         cursor: pointer;
       }
@@ -482,15 +543,21 @@
         background: #ea4335;
         color: #fff;
       }
+      #complete-stop-btn {
+        background: #ffb300;
+        color: #111;
+      }
       #add-stop-btn:disabled,
       #calc-route-btn:disabled,
       #start-nav-btn:disabled,
-      #stop-nav-btn:disabled {
+      #stop-nav-btn:disabled,
+      #complete-stop-btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
       }
       #origin-status,
-      #route-status {
+      #route-status,
+      #map-route-status {
         font-size: 13px;
         color: #444;
         margin-top: 8px;
@@ -525,8 +592,40 @@
         opacity: 0.7;
         cursor: default;
       }
+      .map-view {
+        height: 100%;
+      }
+      .map-shell {
+        position: relative;
+        height: 100%;
+      }
+      .map-toolbar {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        z-index: 10;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 12px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+      }
+      .map-status {
+        position: absolute;
+        left: 16px;
+        bottom: 20px;
+        z-index: 10;
+        max-width: min(90%, 360px);
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 10px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+      }
       gmp-map {
-        height: 480px;
+        height: 100%;
+        min-height: 100vh;
         display: block;
       }
     </style>
@@ -539,49 +638,67 @@
     >
     </gmpx-api-loader>
 
-    <div class="panel">
-      <div id="origin-status">Obteniendo tu ubicación...</div>
+    <section id="setup-view" class="view setup-view active">
+      <div class="panel">
+        <h2>Planifica tu ruta</h2>
+        <p style="margin-top: 4px; color: #666;">
+          Ingresa las ubicaciones que deseas visitar y calcula la ruta.
+        </p>
+        <div id="origin-status">Obteniendo tu ubicación...</div>
 
-      <div id="places-list">
-        <div class="place-row">
-          <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
-          <button
-            type="button"
-            class="remove-btn"
-            onclick="this.parentElement.remove()"
-          >
-            Quitar
-          </button>
+        <div id="places-list">
+          <div class="place-row">
+            <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
+            <button
+              type="button"
+              class="remove-btn"
+              onclick="this.parentElement.remove()"
+            >
+              Quitar
+            </button>
+          </div>
+          <div class="place-row">
+            <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
+            <button
+              type="button"
+              class="remove-btn"
+              onclick="this.parentElement.remove()"
+            >
+              Quitar
+            </button>
+          </div>
         </div>
-        <div class="place-row">
-          <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
-          <button
-            type="button"
-            class="remove-btn"
-            onclick="this.parentElement.remove()"
-          >
-            Quitar
-          </button>
-        </div>
+
+        <button id="add-stop-btn" type="button">Agregar otra parada</button>
+        <button id="calc-route-btn" type="button">Calcular ruta</button>
+
+        <div id="route-status"></div>
+        <div id="route-order"></div>
+        <p style="font-size: 12px; color: #666; margin-top: 8px;">
+          Al acercarte a una parada, se marcará automáticamente como completada. También puedes hacerlo manualmente desde la lista.
+        </p>
       </div>
+    </section>
 
-      <button id="add-stop-btn" type="button">Agregar otra parada</button>
-      <button id="calc-route-btn" type="button">Calcular ruta óptima</button>
-      <button id="start-nav-btn" type="button" disabled>
-        Iniciar navegación
-      </button>
-      <button id="stop-nav-btn" type="button" disabled>
-        Detener navegación
-      </button>
-
-      <div id="route-status"></div>
-      <div id="route-order"></div>
-      <p style="font-size: 12px; color: #666; margin-top: 8px;">
-        Al acercarte a una parada, se marcará automáticamente como completada. También puedes hacerlo manualmente desde la lista.
-      </p>
-    </div>
-
-    <gmp-map center="40.749933,-73.98633" zoom="13" map-id="DEMO_MAP_ID">
-    </gmp-map>
+    <section id="map-view" class="view map-view">
+      <div class="map-shell">
+        <div class="map-toolbar">
+          <button id="start-nav-btn" type="button" disabled>
+            Iniciar navegación
+          </button>
+          <button id="stop-nav-btn" type="button" disabled>
+            Detener navegación
+          </button>
+          <button id="complete-stop-btn" type="button" disabled>
+            Marcar como completada
+          </button>
+        </div>
+        <div id="map-route-status" class="map-status">
+          Calcula una ruta para empezar.
+        </div>
+        <gmp-map center="40.749933,-73.98633" zoom="13" map-id="DEMO_MAP_ID">
+        </gmp-map>
+      </div>
+    </section>
   </body>
 </html>
