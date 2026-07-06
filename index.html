@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Ruta óptima entre varios lugares</title>
+    <script>
+      let map;
+      let directionsService;
+      let directionsRenderer;
+      let userLocation = null;
+      let userMarker = null;
+      let watchId = null;
+      let orderedStops = []; // paradas intermedias en el orden final (sin el destino)
+      let destinoFinal = null;
+      let routePath = []; // overview_path de la ruta activa, para detectar desvíos
+      let lastRecalcTime = 0;
+      let completedStops = [];
+
+      const DEVIATION_THRESHOLD_METERS = 60;
+      const MIN_MS_BETWEEN_RECALCS = 8000;
+      const STOP_COMPLETION_THRESHOLD_METERS = 70;
+
+      async function init() {
+        await customElements.whenDefined('gmp-map');
+        map = document.querySelector('gmp-map');
+        map.innerMap.setOptions({ mapTypeControl: false });
+
+        directionsService = new google.maps.DirectionsService();
+        directionsRenderer = new google.maps.DirectionsRenderer({
+          map: map.innerMap,
+          suppressMarkers: false
+        });
+
+        // Ubicar al usuario para usarlo como origen fijo
+        obtenerUbicacionUsuario();
+
+        document
+          .getElementById('add-stop-btn')
+          .addEventListener('click', agregarParada);
+
+        document
+          .getElementById('calc-route-btn')
+          .addEventListener('click', calcularRutaOptima);
+
+        document
+          .getElementById('start-nav-btn')
+          .addEventListener('click', iniciarNavegacion);
+
+        document
+          .getElementById('stop-nav-btn')
+          .addEventListener('click', detenerNavegacion);
+      }
+
+      function obtenerUbicacionUsuario() {
+        const statusEl = document.getElementById('origin-status');
+        if (!navigator.geolocation) {
+          statusEl.textContent =
+            'Este navegador no soporta geolocalización. No se puede fijar el origen automáticamente.';
+          return;
+        }
+        statusEl.textContent = 'Obteniendo tu ubicación...';
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            userLocation = {
+              lat: position.coords.latitude,
+              lng: position.coords.longitude
+            };
+            statusEl.textContent =
+              'Origen: tu ubicación actual (' +
+              userLocation.lat.toFixed(5) +
+              ', ' +
+              userLocation.lng.toFixed(5) +
+              ')';
+            map.center = userLocation;
+            map.zoom = 13;
+          },
+          (error) => {
+            statusEl.textContent =
+              'No se pudo obtener tu ubicación (' +
+              error.message +
+              '). Actívala en el navegador e inténtalo de nuevo.';
+          }
+        );
+      }
+
+      // Crea o actualiza el marcador de "tu posición" en el mapa.
+      // Si el navegador reporta un rumbo (heading), se dibuja como flecha
+      // orientada; si no, como un punto simple (igual que el "puck" de
+      // Google Maps).
+      function actualizarMarcadorUsuario(position) {
+        const heading = position.coords.heading;
+        const icon =
+          heading !== null && heading !== undefined && !isNaN(heading)
+            ? {
+                path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+                scale: 5,
+                rotation: heading,
+                fillColor: '#1a73e8',
+                fillOpacity: 1,
+                strokeColor: '#ffffff',
+                strokeWeight: 2
+              }
+            : {
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 8,
+                fillColor: '#1a73e8',
+                fillOpacity: 1,
+                strokeColor: '#ffffff',
+                strokeWeight: 2
+              };
+
+        if (!userMarker) {
+          userMarker = new google.maps.Marker({
+            map: map.innerMap,
+            position: userLocation,
+            icon: icon,
+            zIndex: 999
+          });
+        } else {
+          userMarker.setPosition(userLocation);
+          userMarker.setIcon(icon);
+        }
+      }
+
+      function agregarParada() {
+        const lista = document.getElementById('places-list');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'place-row';
+
+        const picker = document.createElement('gmpx-place-picker');
+        picker.setAttribute('placeholder', 'Ingresa un lugar a visitar');
+        picker.addEventListener('gmpx-placechange', () => {
+          recalcularSiHayDatos();
+        });
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-btn';
+        removeBtn.textContent = 'Quitar';
+        removeBtn.addEventListener('click', () => {
+          wrapper.remove();
+          recalcularSiHayDatos();
+        });
+
+        wrapper.appendChild(picker);
+        wrapper.appendChild(removeBtn);
+        lista.appendChild(wrapper);
+        recalcularSiHayDatos();
+      }
+
+      function obtenerDestinosSeleccionados() {
+        const pickers = document.querySelectorAll(
+          '#places-list gmpx-place-picker'
+        );
+        const destinos = [];
+        pickers.forEach((picker) => {
+          const place = picker.value;
+          if (place && place.location) {
+            destinos.push({
+              location: place.location,
+              displayName: place.displayName
+            });
+          }
+        });
+        return destinos;
+      }
+
+      function calcularRutaOptima() {
+        const statusEl = document.getElementById('route-status');
+
+        if (!userLocation) {
+          statusEl.textContent =
+            'Todavía no se tiene tu ubicación como origen. Espera un momento o revisa los permisos de ubicación.';
+          return;
+        }
+
+        const destinos = obtenerDestinosSeleccionados();
+
+        if (destinos.length === 0) {
+          statusEl.textContent =
+            'Ingresa al menos un lugar válido en los campos de búsqueda.';
+          return;
+        }
+
+        destinoFinal = destinos[destinos.length - 1];
+        const waypointsInput = destinos.slice(0, -1);
+
+        if (waypointsInput.length === 0) {
+          statusEl.textContent = 'Se necesita al menos una parada intermedia para optimizar la ruta.';
+          return;
+        }
+
+        statusEl.textContent = 'Calculando la ruta óptima para ahorrar combustible...';
+
+        directionsService.route(
+          {
+            origin: userLocation,
+            destination: destinoFinal.location,
+            waypoints: waypointsInput.map((d) => ({
+              location: d.location,
+              stopover: true
+            })),
+            optimizeWaypoints: true,
+            travelMode: google.maps.TravelMode.DRIVING,
+            avoidHighways: false,
+            avoidTolls: false
+          },
+          (result, status) => {
+            if (status === google.maps.DirectionsStatus.OK) {
+              directionsRenderer.setDirections(result);
+              const order = result.routes[0].waypoint_order;
+              orderedStops = order.map((i) => waypointsInput[i]);
+              completedStops = new Array(orderedStops.length).fill(false);
+              routePath = result.routes[0].overview_path;
+              mostrarOrdenOptimizado(result);
+              statusEl.textContent = 'Ruta reordenada para reducir distancia y consumo.';
+              document.getElementById('start-nav-btn').disabled = false;
+            } else {
+              statusEl.textContent =
+                'No se pudo calcular la ruta (' + status + ').';
+            }
+          }
+        );
+      }
+
+      function recalcularSiHayDatos() {
+        const pickers = document.querySelectorAll('#places-list gmpx-place-picker');
+        const tieneDatos = Array.from(pickers).some((picker) => {
+          const place = picker.value;
+          return place && place.location;
+        });
+
+        if (tieneDatos && userLocation) {
+          calcularRutaOptima();
+        }
+      }
+
+      function mostrarOrdenOptimizado(result) {
+        const orderEl = document.getElementById('route-order');
+
+        if (!orderedStops.length) {
+          orderEl.innerHTML = '';
+          return;
+        }
+
+        let html = '<ol class="stop-list">';
+        orderedStops.forEach((stop, index) => {
+          const completed = completedStops[index];
+          const label = stop.displayName || 'Parada ' + (index + 1);
+          html +=
+            '<li class="stop-item' +
+            (completed ? ' completed' : '') +
+            '"><span class="stop-label">' +
+            label +
+            '</span><button type="button" class="complete-btn" data-index="' +
+            index +
+            '"' +
+            (completed ? ' disabled' : '') +
+            '>' +
+            (completed ? 'Completada' : 'Marcar como completada') +
+            '</button></li>';
+        });
+        html += '</ol>';
+        orderEl.innerHTML = html;
+
+        orderEl.querySelectorAll('.complete-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            marcarParadaCompletada(Number(btn.dataset.index));
+          });
+        });
+      }
+
+      function marcarParadaCompletada(index) {
+        if (index < 0 || index >= completedStops.length || completedStops[index]) {
+          return;
+        }
+
+        completedStops[index] = true;
+        mostrarOrdenOptimizado();
+        document.getElementById('route-status').textContent =
+          'Parada marcada como completada.';
+      }
+
+      function completarParadaMasCercana(location) {
+        if (!orderedStops.length) return false;
+
+        const currentPoint = new google.maps.LatLng(location.lat, location.lng);
+
+        for (let index = 0; index < orderedStops.length; index += 1) {
+          if (completedStops[index]) continue;
+
+          const distance = google.maps.geometry.spherical.computeDistanceBetween(
+            currentPoint,
+            orderedStops[index].location
+          );
+
+          if (distance <= STOP_COMPLETION_THRESHOLD_METERS) {
+            marcarParadaCompletada(index);
+            return true;
+          }
+        }
+
+        return false;
+      }
+
+      function iniciarNavegacion() {
+        const statusEl = document.getElementById('route-status');
+
+        if (!destinoFinal) {
+          statusEl.textContent = 'Primero calcula una ruta.';
+          return;
+        }
+        if (!navigator.geolocation) {
+          statusEl.textContent =
+            'Este navegador no soporta seguimiento de ubicación en vivo.';
+          return;
+        }
+
+        document.getElementById('start-nav-btn').disabled = true;
+        document.getElementById('stop-nav-btn').disabled = false;
+        statusEl.textContent = 'Navegación iniciada. Siguiendo tu posición...';
+
+        watchId = navigator.geolocation.watchPosition(
+          onPositionUpdate,
+          (error) => {
+            statusEl.textContent =
+              'Error obteniendo tu posición (' + error.message + ').';
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 1000,
+            timeout: 10000
+          }
+        );
+      }
+
+      function detenerNavegacion() {
+        if (watchId !== null) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+        document.getElementById('start-nav-btn').disabled = false;
+        document.getElementById('stop-nav-btn').disabled = true;
+        document.getElementById('route-status').textContent =
+          'Navegación detenida.';
+      }
+
+      function onPositionUpdate(position) {
+        userLocation = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude
+        };
+
+        // Mantener la misma vista: solo se recentra el mapa en la
+        // posición actual, sin cambiar el zoom que ya tenía el usuario.
+        map.center = userLocation;
+
+        actualizarMarcadorUsuario(position);
+        completarParadaMasCercana(userLocation);
+
+        if (huboDesvio(userLocation)) {
+          recalcularDesdePosicionActual();
+        }
+      }
+
+      // Calcula la distancia mínima entre la posición actual y el trazo
+      // de la ruta activa (routePath) para saber si el usuario se desvió.
+      function huboDesvio(location) {
+        if (!routePath || routePath.length === 0) return false;
+
+        const puntoActual = new google.maps.LatLng(location.lat, location.lng);
+        let distanciaMinima = Infinity;
+
+        for (let i = 0; i < routePath.length; i++) {
+          const distancia = google.maps.geometry.spherical.computeDistanceBetween(
+            puntoActual,
+            routePath[i]
+          );
+          if (distancia < distanciaMinima) {
+            distanciaMinima = distancia;
+          }
+        }
+
+        return distanciaMinima > DEVIATION_THRESHOLD_METERS;
+      }
+
+      function recalcularDesdePosicionActual() {
+        const now = Date.now();
+        if (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS) {
+          return; // evita recalcular demasiado seguido
+        }
+        lastRecalcTime = now;
+
+        const statusEl = document.getElementById('route-status');
+        statusEl.textContent =
+          'Te desviaste de la ruta. Recalculando...';
+
+        directionsService.route(
+          {
+            origin: userLocation,
+            destination: destinoFinal.location,
+            waypoints: orderedStops.map((d) => ({
+              location: d.location,
+              stopover: true
+            })),
+            // Se mantiene el orden ya definido en el cálculo inicial;
+            // no se vuelve a optimizar para no cambiar el plan de paradas
+            // mientras se está navegando.
+            optimizeWaypoints: false,
+            travelMode: google.maps.TravelMode.DRIVING
+          },
+          (result, status) => {
+            if (status === google.maps.DirectionsStatus.OK) {
+              directionsRenderer.setDirections(result);
+              routePath = result.routes[0].overview_path;
+              mostrarOrdenOptimizado(result);
+              statusEl.textContent = 'Ruta recalculada.';
+            } else {
+              statusEl.textContent =
+                'No se pudo recalcular la ruta (' + status + ').';
+            }
+          }
+        );
+      }
+
+      document.addEventListener('DOMContentLoaded', init);
+    </script>
+    <script
+      type="module"
+      src="https://ajax.googleapis.com/ajax/libs/@googlemaps/extended-component-library/0.6.11/index.min.js"
+    ></script>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        font-family: Arial, sans-serif;
+      }
+      .panel {
+        padding: 16px 20px;
+        max-width: 480px;
+      }
+      .place-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      .place-row gmpx-place-picker {
+        flex: 1;
+      }
+      .remove-btn {
+        border: 1px solid #ccc;
+        background: #fff;
+        border-radius: 4px;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      #add-stop-btn,
+      #calc-route-btn,
+      #start-nav-btn,
+      #stop-nav-btn {
+        margin-top: 8px;
+        margin-right: 8px;
+        padding: 8px 14px;
+        border-radius: 4px;
+        border: none;
+        cursor: pointer;
+      }
+      #add-stop-btn {
+        background: #f1f3f4;
+      }
+      #calc-route-btn {
+        background: #1a73e8;
+        color: #fff;
+      }
+      #start-nav-btn {
+        background: #34a853;
+        color: #fff;
+      }
+      #stop-nav-btn {
+        background: #ea4335;
+        color: #fff;
+      }
+      #add-stop-btn:disabled,
+      #calc-route-btn:disabled,
+      #start-nav-btn:disabled,
+      #stop-nav-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #origin-status,
+      #route-status {
+        font-size: 13px;
+        color: #444;
+        margin-top: 8px;
+      }
+      #route-order {
+        font-size: 13px;
+        margin-top: 8px;
+      }
+      .stop-list {
+        padding-left: 18px;
+        display: grid;
+        gap: 8px;
+      }
+      .stop-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      .stop-item.completed {
+        color: #188038;
+      }
+      .complete-btn {
+        border: 1px solid #1a73e8;
+        background: #e8f0fe;
+        color: #1a73e8;
+        border-radius: 4px;
+        padding: 4px 8px;
+        cursor: pointer;
+      }
+      .complete-btn:disabled {
+        opacity: 0.7;
+        cursor: default;
+      }
+      gmp-map {
+        height: 480px;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <gmpx-api-loader
+      key="AIzaSyBGPBUvSXI_1HPzODbPh42DUVhGwTMPP30"
+      solution-channel="GMP_GE_mapsandplacesautocomplete_v2"
+      libraries="places,geometry"
+    >
+    </gmpx-api-loader>
+
+    <div class="panel">
+      <div id="origin-status">Obteniendo tu ubicación...</div>
+
+      <div id="places-list">
+        <div class="place-row">
+          <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
+          <button
+            type="button"
+            class="remove-btn"
+            onclick="this.parentElement.remove()"
+          >
+            Quitar
+          </button>
+        </div>
+        <div class="place-row">
+          <gmpx-place-picker placeholder="Ingresa un lugar a visitar"></gmpx-place-picker>
+          <button
+            type="button"
+            class="remove-btn"
+            onclick="this.parentElement.remove()"
+          >
+            Quitar
+          </button>
+        </div>
+      </div>
+
+      <button id="add-stop-btn" type="button">Agregar otra parada</button>
+      <button id="calc-route-btn" type="button">Calcular ruta óptima</button>
+      <button id="start-nav-btn" type="button" disabled>
+        Iniciar navegación
+      </button>
+      <button id="stop-nav-btn" type="button" disabled>
+        Detener navegación
+      </button>
+
+      <div id="route-status"></div>
+      <div id="route-order"></div>
+      <p style="font-size: 12px; color: #666; margin-top: 8px;">
+        Al acercarte a una parada, se marcará automáticamente como completada. También puedes hacerlo manualmente desde la lista.
+      </p>
+    </div>
+
+    <gmp-map center="40.749933,-73.98633" zoom="13" map-id="DEMO_MAP_ID">
+    </gmp-map>
+  </body>
+</html>
