@@ -110,9 +110,49 @@
         }
       }
 
+      function guardarEstadoRuta() {
+        const payload = {
+          userLocation: userLocation
+            ? { lat: typeof userLocation.lat === 'function' ? userLocation.lat() : userLocation.lat,
+                lng: typeof userLocation.lng === 'function' ? userLocation.lng() : userLocation.lng }
+            : null,
+          destinoFinal: destinoFinal
+            ? {
+                displayName: destinoFinal.displayName,
+                location: destinoFinal.location
+                  ? {
+                      lat: typeof destinoFinal.location.lat === 'function' ? destinoFinal.location.lat() : destinoFinal.location.lat,
+                      lng: typeof destinoFinal.location.lng === 'function' ? destinoFinal.location.lng() : destinoFinal.location.lng
+                    }
+                  : null
+              }
+            : null,
+          orderedStops: orderedStops.map((stop) => ({
+            displayName: stop.displayName,
+            location: stop.location
+              ? {
+                  lat: typeof stop.location.lat === 'function' ? stop.location.lat() : stop.location.lat,
+                  lng: typeof stop.location.lng === 'function' ? stop.location.lng() : stop.location.lng
+                }
+              : null
+          })),
+          completedStops,
+          routePath: routePath.map((point) => ({
+            lat: typeof point.lat === 'function' ? point.lat() : point.lat,
+            lng: typeof point.lng === 'function' ? point.lng() : point.lng
+          }))
+        };
+        const serialized = JSON.stringify(payload);
+        sessionStorage.setItem(STORAGE_KEY, serialized);
+        localStorage.setItem(STORAGE_KEY, serialized);
+        return payload;
+      }
+
       function setStatus(message, target = 'both') {
         const mapStatus = document.getElementById('map-route-status');
-        mapStatus.textContent = message;
+        if (mapStatus) {
+          mapStatus.textContent = message;
+        }
       }
 
       function dibujarRutaGuardada() {
@@ -120,7 +160,8 @@
           return;
         }
 
-        const waypoints = orderedStops.map((d) => ({ location: d.location, stopover: true }));
+        const pendingWaypoints = orderedStops.filter((stop, index) => !completedStops[index]);
+        const waypoints = pendingWaypoints.map((d) => ({ location: d.location, stopover: true }));
         directionsService.route(
           {
             origin: userLocation,
@@ -135,7 +176,8 @@
               mostrarOrdenOptimizado();
               mostrarRutaEnMapa(result.routes[0]);
               setStatus('Ruta cargada correctamente.', 'both');
-              document.getElementById('start-nav-btn').disabled = false;
+              document.getElementById('start-nav-btn').disabled = (watchId !== null);
+              document.getElementById('stop-nav-btn').disabled = (watchId === null);
               document.getElementById('complete-stop-btn').disabled = false;
             } else {
               setStatus('No se pudo cargar la ruta (' + status + ').', 'both');
@@ -240,7 +282,9 @@
       function marcarParadaCompletada(index) {
         if (index < 0 || index >= completedStops.length || completedStops[index]) return;
         completedStops[index] = true;
+        guardarEstadoRuta();
         mostrarOrdenOptimizado();
+        dibujarRutaGuardada();
         setStatus('Parada marcada como completada.', 'both');
       }
 
@@ -249,15 +293,14 @@
           setStatus('Primero calcula una ruta.', 'both');
           return;
         }
-        if (!userLocation) {
-          setStatus('Esperando tu ubicación para marcar la parada.', 'both');
+        if (userLocation && completarParadaMasCercana(userLocation)) {
           return;
         }
-
-        if (completarParadaMasCercana(userLocation)) {
-          setStatus('Parada marcada como completada.', 'both');
+        const nextPendingIndex = completedStops.findIndex((completed) => !completed);
+        if (nextPendingIndex !== -1) {
+          marcarParadaCompletada(nextPendingIndex);
         } else {
-          setStatus('Todavía no estás cerca de una parada pendiente.', 'both');
+          setStatus('Todas las paradas ya están completadas.', 'both');
         }
       }
 
@@ -333,15 +376,18 @@
       }
 
       function recalcularDesdePosicionActual() {
+        if (!destinoFinal || !userLocation) return;
         const now = Date.now();
         if (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS) return;
         lastRecalcTime = now;
         setStatus('Te desviaste de la ruta. Recalculando...', 'both');
+        const pendingWaypoints = orderedStops.filter((stop, index) => !completedStops[index]);
+        const waypoints = pendingWaypoints.map((d) => ({ location: d.location, stopover: true }));
         directionsService.route(
           {
             origin: userLocation,
             destination: destinoFinal.location,
-            waypoints: orderedStops.map((d) => ({ location: d.location, stopover: true })),
+            waypoints,
             optimizeWaypoints: false,
             travelMode: google.maps.TravelMode.DRIVING
           },
@@ -350,7 +396,7 @@
               directionsRenderer.setDirections(result);
               routePath = result.routes[0].overview_path;
               mostrarOrdenOptimizado();
-              setStatus('Ruta recalculada.', 'both');
+              setStatus('Ruta actualizada.', 'both');
             } else {
               setStatus('No se pudo recalcular la ruta (' + status + ').', 'both');
             }
@@ -413,7 +459,12 @@
       #stop-nav-btn { background: #ea4335; color: #fff; }
       #complete-stop-btn { background: #ffb300; color: #111; }
       button:disabled { opacity: 0.5; cursor: not-allowed; }
-      #route-order { font-size: 13px; margin-top: 8px; }
+      #route-order {
+        font-size: 13px;
+        margin-top: 8px;
+        max-height: 200px;
+        overflow-y: auto;
+      }
       .stop-list { padding-left: 18px; display: grid; gap: 8px; }
       .stop-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
       .stop-item.completed { color: #188038; }
@@ -444,7 +495,10 @@
         <button id="stop-nav-btn" type="button" disabled>Detener navegación</button>
         <button id="complete-stop-btn" type="button" disabled>Marcar como completada</button>
       </div>
-      <div id="map-route-status" class="status">Cargando ruta…</div>
+      <div class="status">
+        <div id="map-route-status">Cargando ruta…</div>
+        <div id="route-order"></div>
+      </div>
       <gmp-map center="40.749933,-73.98633" zoom="13" map-id="DEMO_MAP_ID"></gmp-map>
     </div>
   </body>

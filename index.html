@@ -381,7 +381,9 @@
         }
 
         completedStops[index] = true;
+        guardarEstadoRuta();
         mostrarOrdenOptimizado();
+        recalcularDesdePosicionActual(true);
         setStatus('Parada marcada como completada.', 'both');
       }
 
@@ -390,15 +392,14 @@
           setStatus('Primero calcula una ruta.', 'both');
           return;
         }
-        if (!userLocation) {
-          setStatus('Esperando tu ubicación para marcar la parada.', 'both');
+        if (userLocation && completarParadaMasCercana(userLocation)) {
           return;
         }
-
-        if (completarParadaMasCercana(userLocation)) {
-          setStatus('Parada marcada como completada.', 'both');
+        const nextPendingIndex = completedStops.findIndex((completed) => !completed);
+        if (nextPendingIndex !== -1) {
+          marcarParadaCompletada(nextPendingIndex);
         } else {
-          setStatus('Todavía no estás cerca de una parada pendiente.', 'both');
+          setStatus('Todas las paradas ya están completadas.', 'both');
         }
       }
 
@@ -495,23 +496,29 @@
         return distanciaMinima > DEVIATION_THRESHOLD_METERS;
       }
 
-      function recalcularDesdePosicionActual() {
+      function recalcularDesdePosicionActual(force = false) {
+        if (!destinoFinal || !userLocation) return;
+
         const now = Date.now();
-        if (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS) {
+        if (!force && (now - lastRecalcTime < MIN_MS_BETWEEN_RECALCS)) {
           return;
         }
         lastRecalcTime = now;
 
-        setStatus('Te desviaste de la ruta. Recalculando...', 'both');
+        const msg = force ? 'Actualizando ruta...' : 'Te desviaste de la ruta. Recalculando...';
+        setStatus(msg, 'both');
+
+        const pendingWaypoints = orderedStops.filter((stop, index) => !completedStops[index]);
+        const waypoints = pendingWaypoints.map((d) => ({
+          location: d.location,
+          stopover: true
+        }));
 
         directionsService.route(
           {
             origin: userLocation,
             destination: destinoFinal.location,
-            waypoints: orderedStops.map((d) => ({
-              location: d.location,
-              stopover: true
-            })),
+            waypoints: waypoints,
             optimizeWaypoints: false,
             travelMode: google.maps.TravelMode.DRIVING
           },
@@ -520,7 +527,7 @@
               directionsRenderer.setDirections(result);
               routePath = result.routes[0].overview_path;
               mostrarOrdenOptimizado(result);
-              setStatus('Ruta recalculada.', 'both');
+              setStatus('Ruta actualizada.', 'both');
             } else {
               setStatus('No se pudo recalcular la ruta (' + status + ').', 'both');
             }
